@@ -6,36 +6,40 @@ import sqlite3
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+import requests
 from aiogram import Bot, Dispatcher
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-import requests
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 API_BASE = "https://api.tgmrkt.io/api/v1"
 DB_PATH = os.getenv("DB_PATH", "mrkt_bot.db")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-MRKT_TOKEN = os.getenv("MRKT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MRKT_TOKEN = os.getenv("MRKT_TOKEN", "").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "45"))
-DEFAULT_SAMPLE_LIMIT = int(os.getenv("DEFAULT_SAMPLE_LIMIT", "20"))
+DEFAULT_SAMPLE_LIMIT = min(int(os.getenv("DEFAULT_SAMPLE_LIMIT", "20")), 20)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 
+class MRKTAPIError(Exception):
+    pass
+
+
 def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 
 def init_db() -> None:
@@ -86,6 +90,7 @@ class UserFilter:
     is_enabled: bool
 
 
+
 def ensure_user(user_id: int) -> None:
     now = int(time.time())
     conn = db_connect()
@@ -107,28 +112,53 @@ def ensure_user(user_id: int) -> None:
 def set_enabled(user_id: int, enabled: bool) -> None:
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET is_enabled = ?, updated_at = ? WHERE user_id = ?", (1 if enabled else 0, int(time.time()), user_id))
+    cur.execute(
+        "UPDATE users SET is_enabled = ?, updated_at = ? WHERE user_id = ?",
+        (1 if enabled else 0, int(time.time()), user_id),
+    )
     conn.commit()
     conn.close()
 
 
 
-def update_filter(user_id: int, *, collections=None, models=None, min_price=None, max_price=None) -> None:
+def update_filter(
+    user_id: int,
+    *,
+    collections: Optional[List[str]] = None,
+    models: Optional[List[str]] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    reset_price: bool = False,
+) -> None:
     conn = db_connect()
     cur = conn.cursor()
     row = cur.execute("SELECT * FROM filters WHERE user_id = ?", (user_id,)).fetchone()
     current = dict(row) if row else {}
-    new_collections = json.dumps(collections if collections is not None else json.loads(current.get("collections", "[]")))
-    new_models = json.dumps(models if models is not None else json.loads(current.get("models", "[]")))
-    new_min = min_price if min_price is not None or min_price is None else current.get("min_price")
-    new_max = max_price if max_price is not None or max_price is None else current.get("max_price")
+
+    new_collections = collections if collections is not None else json.loads(current.get("collections", "[]"))
+    new_models = models if models is not None else json.loads(current.get("models", "[]"))
+
+    if reset_price:
+        new_min = None
+        new_max = None
+    else:
+        new_min = min_price if min_price is not None else current.get("min_price")
+        new_max = max_price if max_price is not None else current.get("max_price")
+
     cur.execute(
         """
         UPDATE filters
         SET collections = ?, models = ?, min_price = ?, max_price = ?, updated_at = ?
         WHERE user_id = ?
         """,
-        (new_collections, new_models, new_min, new_max, int(time.time()), user_id),
+        (
+            json.dumps(new_collections, ensure_ascii=False),
+            json.dumps(new_models, ensure_ascii=False),
+            new_min,
+            new_max,
+            int(time.time()),
+            user_id,
+        ),
     )
     conn.commit()
     conn.close()
@@ -141,6 +171,11 @@ def get_filter(user_id: int) -> UserFilter:
     row_user = cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
     row_filter = cur.execute("SELECT * FROM filters WHERE user_id = ?", (user_id,)).fetchone()
     conn.close()
+
+    if row_user is None or row_filter is None:
+        ensure_user(user_id)
+        return get_filter(user_id)
+
     return UserFilter(
         user_id=user_id,
         collections=json.loads(row_filter["collections"]),
@@ -175,20 +210,20 @@ def remember_listing(listing_key: str) -> bool:
 
 
 
-def build_payload(user_filter: UserFilter, cursor: str = "") -> Dict[str, Any]:
+def build_payload() -> Dict[str, Any]:
     return {
-        "collectionNames": user_filter.collections,
-        "modelNames": user_filter.models,
+        "collectionNames": [],
+        "modelNames": [],
         "backdropNames": [],
         "symbolNames": [],
-        "ordering": None,
+        "ordering": "Price",
         "lowToHigh": True,
-        "maxPrice": user_filter.max_price,
-        "minPrice": user_filter.min_price,
+        "maxPrice": None,
+        "minPrice": None,
         "mintable": None,
         "number": None,
         "count": DEFAULT_SAMPLE_LIMIT,
-        "cursor": cursor,
+        "cursor": "",
         "query": None,
         "promotedFirst": False,
     }
@@ -199,22 +234,29 @@ def mrkt_headers() -> Dict[str, str]:
     return {
         "Authorization": MRKT_TOKEN,
         "Referer": "https://cdn.tgmrkt.io/",
+        "Origin": "https://cdn.tgmrkt.io",
         "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
     }
 
 
 
-def fetch_gifts(user_filter: UserFilter) -> List[Dict[str, Any]]:
-    payload = build_payload(user_filter)
-    response = requests.post(
-        f"{API_BASE}/gifts/saling",
-        headers=mrkt_headers(),
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data.get("gifts", [])
+def extract_gifts_from_response(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if not isinstance(data, dict):
+        return []
+
+    for key in ("gifts", "items", "data", "results"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+        if isinstance(value, dict):
+            for nested_key in ("gifts", "items", "results"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, list):
+                    return [x for x in nested_value if isinstance(x, dict)]
+    return []
 
 
 
@@ -255,8 +297,7 @@ def extract_link(item: Dict[str, Any]) -> str:
         val = item.get(key)
         if val:
             return str(val)
-    slug = item.get("slug") or item.get("id") or item.get("giftId")
-    return f"https://t.me/mrkt" if not slug else f"https://t.me/mrkt"
+    return "https://t.me/mrkt"
 
 
 
@@ -265,6 +306,57 @@ def extract_listing_key(item: Dict[str, Any]) -> str:
         if item.get(key) is not None:
             return f"{key}:{item.get(key)}"
     return json.dumps(item, sort_keys=True, ensure_ascii=False)
+
+
+
+def gift_matches_filters(item: Dict[str, Any], user_filter: UserFilter) -> bool:
+    collections = [x.strip().lower() for x in user_filter.collections if x.strip()]
+    models = [x.strip().lower() for x in user_filter.models if x.strip()]
+
+    haystack = " ".join(
+        [
+            str(item.get("name", "")),
+            str(item.get("title", "")),
+            str(item.get("giftName", "")),
+            str(item.get("collectionName", "")),
+            str(item.get("modelName", "")),
+            str(item.get("backdropName", "")),
+            str(item.get("symbolName", "")),
+        ]
+    ).lower()
+
+    if collections and not any(word in haystack for word in collections):
+        return False
+
+    if models and not any(word in haystack for word in models):
+        return False
+
+    price = extract_price(item)
+    if user_filter.min_price is not None and price is not None and price < user_filter.min_price:
+        return False
+    if user_filter.max_price is not None and price is not None and price > user_filter.max_price:
+        return False
+
+    return True
+
+
+
+def fetch_gifts(user_filter: UserFilter) -> List[Dict[str, Any]]:
+    payload = build_payload()
+    response = requests.post(
+        f"{API_BASE}/gifts/saling",
+        headers=mrkt_headers(),
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code >= 400:
+        body_preview = response.text[:1000]
+        raise MRKTAPIError(f"{response.status_code} {body_preview}")
+
+    data = response.json()
+    gifts = extract_gifts_from_response(data)
+    return [item for item in gifts if gift_matches_filters(item, user_filter)]
 
 
 
@@ -284,7 +376,7 @@ def compute_stats(gifts: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
 
 def format_stats_text(stats: Dict[str, Optional[float]], title: str = "Статистика") -> str:
     if not stats["count"]:
-        return f"<b>{title}</b>\nЛоты не найдены."
+        return f"<b>{title}</b>\nЛоты не найдены по текущим фильтрам."
     return (
         f"<b>{title}</b>\n"
         f"Лотов в выборке: <b>{stats['count']}</b>\n"
@@ -308,8 +400,6 @@ def pretty_filter_text(user_filter: UserFilter) -> str:
 
 async def start_cmd(message: Message) -> None:
     ensure_user(message.from_user.id)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Вкл уведомления", callback_data="noop")
     text = (
         "<b>MRKT Alert Bot</b>\n\n"
         "Бот следит за новыми выставлениями на MRKT и шлёт алерты по твоим фильтрам.\n\n"
@@ -317,6 +407,7 @@ async def start_cmd(message: Message) -> None:
         "/set_collections часы, кепки\n"
         "/set_models albino, gold\n"
         "/set_price 1 20\n"
+        "/reset_price\n"
         "/stats\n"
         "/filters\n"
         "/on и /off\n"
@@ -328,12 +419,13 @@ async def start_cmd(message: Message) -> None:
 async def help_cmd(message: Message) -> None:
     await message.answer(
         "<b>Как пользоваться</b>\n"
-        "1. Задай типы подарков: <code>/set_collections часы, кепки</code>\n"
+        "1. Задай ключевые слова по подаркам: <code>/set_collections часы, кепки</code>\n"
         "2. При желании укажи модели: <code>/set_models gold, black</code>\n"
         "3. Ограничь цену: <code>/set_price 1 15</code>\n"
-        "4. Получи статистику: <code>/stats</code>\n"
-        "5. Оставь бот включённым — он будет слать новые лоты по фильтру.\n\n"
-        "Важно: сейчас статистика строится по текущим выставленным лотам, а не по подтверждённой истории сделок."
+        "4. Сбросить цену: <code>/reset_price</code>\n"
+        "5. Получи статистику: <code>/stats</code>\n"
+        "6. Оставь бот включённым — он будет слать новые лоты по фильтру.\n\n"
+        "Важно: API MRKT фильтруется по внутренним значениям, поэтому бот теперь берёт общий список лотов и фильтрует его локально по словам и цене."
     )
 
 
@@ -366,15 +458,7 @@ async def set_models_cmd(message: Message) -> None:
     ensure_user(message.from_user.id)
     raw = (message.text or "").replace("/set_models", "", 1).strip()
     values = [x.strip() for x in raw.split(",") if x.strip()]
-    current = get_filter(message.from_user.id)
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE filters SET models = ?, updated_at = ? WHERE user_id = ?",
-        (json.dumps(values), int(time.time()), message.from_user.id),
-    )
-    conn.commit()
-    conn.close()
+    update_filter(message.from_user.id, models=values)
     await message.answer(f"Сохранил модели: <code>{', '.join(values) if values else 'все'}</code>")
 
 
@@ -384,17 +468,26 @@ async def set_price_cmd(message: Message) -> None:
     if len(parts) != 3:
         await message.answer("Формат: <code>/set_price 1 20</code>")
         return
-    min_price = float(parts[1])
-    max_price = float(parts[2])
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE filters SET min_price = ?, max_price = ?, updated_at = ? WHERE user_id = ?",
-        (min_price, max_price, int(time.time()), message.from_user.id),
-    )
-    conn.commit()
-    conn.close()
+
+    try:
+        min_price = float(parts[1].replace(",", "."))
+        max_price = float(parts[2].replace(",", "."))
+    except ValueError:
+        await message.answer("Цена должна быть числом. Пример: <code>/set_price 1 20</code>")
+        return
+
+    if min_price > max_price:
+        await message.answer("Минимальная цена не может быть больше максимальной.")
+        return
+
+    update_filter(message.from_user.id, min_price=min_price, max_price=max_price)
     await message.answer(f"Диапазон цены сохранён: <b>{min_price}</b>–<b>{max_price}</b> TON")
+
+
+async def reset_price_cmd(message: Message) -> None:
+    ensure_user(message.from_user.id)
+    update_filter(message.from_user.id, reset_price=True)
+    await message.answer("Фильтр цены сброшен.")
 
 
 async def stats_cmd(message: Message) -> None:
@@ -402,15 +495,22 @@ async def stats_cmd(message: Message) -> None:
     user_filter = get_filter(message.from_user.id)
     try:
         gifts = fetch_gifts(user_filter)
+    except MRKTAPIError as e:
+        await message.answer(f"Ошибка MRKT API: <code>{e}</code>")
+        return
     except Exception as e:
         await message.answer(f"Ошибка запроса к MRKT: <code>{e}</code>")
         return
+
     stats = compute_stats(gifts)
     lines = [format_stats_text(stats)]
     preview = []
     for item in gifts[:5]:
         price = extract_price(item)
-        preview.append(f"• {extract_name(item)} / {extract_model(item)} — <b>{price:.2f} TON</b>" if price is not None else f"• {extract_name(item)} / {extract_model(item)}")
+        if price is not None:
+            preview.append(f"• {extract_name(item)} / {extract_model(item)} — <b>{price:.2f} TON</b>")
+        else:
+            preview.append(f"• {extract_name(item)} / {extract_model(item)}")
     if preview:
         lines.append("\n<b>Первые лоты:</b>\n" + "\n".join(preview))
     await message.answer("\n\n".join(lines))
@@ -429,13 +529,15 @@ async def monitor_loop(bot: Bot) -> None:
                     listing_key = extract_listing_key(item)
                     if remember_listing(f"{user_id}:{listing_key}"):
                         new_items.append(item)
+
                 for item in new_items[:10]:
                     price = extract_price(item)
+                    price_text = f"<b>{price:.2f} TON</b>" if price is not None else "<b>цена не указана</b>"
                     text = (
                         "<b>Новое выставление на MRKT</b>\n"
                         f"Подарок: <b>{extract_name(item)}</b>\n"
                         f"Модель: <b>{extract_model(item)}</b>\n"
-                        f"Цена: <b>{price:.2f} TON</b>\n"
+                        f"Цена: {price_text}\n"
                         f"Ссылка: {extract_link(item)}"
                     )
                     await bot.send_message(user_id, text)
@@ -464,6 +566,7 @@ async def main() -> None:
     dp.message.register(set_collections_cmd, Command("set_collections"))
     dp.message.register(set_models_cmd, Command("set_models"))
     dp.message.register(set_price_cmd, Command("set_price"))
+    dp.message.register(reset_price_cmd, Command("reset_price"))
     dp.message.register(stats_cmd, Command("stats"))
 
     asyncio.create_task(monitor_loop(bot))
