@@ -35,11 +35,20 @@ class MRKTAPIError(Exception):
     pass
 
 
+@dataclass
+class UserFilter:
+    user_id: int
+    collections: List[str]
+    models: List[str]
+    min_price: Optional[float]
+    max_price: Optional[float]
+    is_enabled: bool
+
+
 def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 
 def init_db() -> None:
@@ -80,17 +89,6 @@ def init_db() -> None:
     conn.close()
 
 
-@dataclass
-class UserFilter:
-    user_id: int
-    collections: List[str]
-    models: List[str]
-    min_price: Optional[float]
-    max_price: Optional[float]
-    is_enabled: bool
-
-
-
 def ensure_user(user_id: int) -> None:
     now = int(time.time())
     conn = db_connect()
@@ -108,7 +106,6 @@ def ensure_user(user_id: int) -> None:
     conn.close()
 
 
-
 def set_enabled(user_id: int, enabled: bool) -> None:
     conn = db_connect()
     cur = conn.cursor()
@@ -118,7 +115,6 @@ def set_enabled(user_id: int, enabled: bool) -> None:
     )
     conn.commit()
     conn.close()
-
 
 
 def update_filter(
@@ -164,7 +160,6 @@ def update_filter(
     conn.close()
 
 
-
 def get_filter(user_id: int) -> UserFilter:
     conn = db_connect()
     cur = conn.cursor()
@@ -186,14 +181,12 @@ def get_filter(user_id: int) -> UserFilter:
     )
 
 
-
 def get_enabled_user_ids() -> List[int]:
     conn = db_connect()
     cur = conn.cursor()
     rows = cur.execute("SELECT user_id FROM users WHERE is_enabled = 1").fetchall()
     conn.close()
     return [r[0] for r in rows]
-
 
 
 def remember_listing(listing_key: str) -> bool:
@@ -209,11 +202,10 @@ def remember_listing(listing_key: str) -> bool:
         conn.close()
 
 
-
-def build_payload() -> Dict[str, Any]:
-    return {
-        "collectionNames": [],
-        "modelNames": [],
+def build_payload(user_filter: UserFilter) -> Dict[str, Any]:
+    payload = {
+        "collectionNames": user_filter.collections,
+        "modelNames": user_filter.models,
         "backdropNames": [],
         "symbolNames": [],
         "ordering": "Price",
@@ -227,7 +219,11 @@ def build_payload() -> Dict[str, Any]:
         "query": None,
         "promotedFirst": False,
     }
-
+    if user_filter.max_price is not None:
+        payload["maxPrice"] = to_raw_ton_value(user_filter.max_price)
+    if user_filter.min_price is not None:
+        payload["minPrice"] = to_raw_ton_value(user_filter.min_price)
+    return payload
 
 
 def mrkt_headers() -> Dict[str, str]:
@@ -238,7 +234,6 @@ def mrkt_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
     }
-
 
 
 def extract_gifts_from_response(data: Any) -> List[Dict[str, Any]]:
@@ -259,75 +254,161 @@ def extract_gifts_from_response(data: Any) -> List[Dict[str, Any]]:
     return []
 
 
-
-def extract_price(item: Dict[str, Any]) -> Optional[float]:
-    for key in ("price", "salePrice", "amount", "tonPrice"):
-        value = item.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                return float(value.replace(",", ".").strip())
-            except Exception:
-                pass
+def maybe_nested_value(item: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in item and item[key] not in (None, ""):
+            return item[key]
+    for nested_key in ("gift", "item", "nft", "asset"):
+        nested = item.get(nested_key)
+        if isinstance(nested, dict):
+            for key in keys:
+                if key in nested and nested[key] not in (None, ""):
+                    return nested[key]
     return None
 
+
+def normalize_ton_value(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        value = value.replace("TON", "").replace("ton", "").replace(" ", "").replace(",", ".")
+        if not value:
+            return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    # MRKT often returns nanoton integer values like 2180000000 -> 2.18 TON
+    if abs(num) >= 100000:
+        num = num / 1_000_000_000
+    return num
+
+
+def to_raw_ton_value(value: float) -> int:
+    return int(round(value * 1_000_000_000))
+
+
+def extract_price(item: Dict[str, Any]) -> Optional[float]:
+    for key in (
+        "price",
+        "salePrice",
+        "amount",
+        "tonPrice",
+        "floorPrice",
+        "currentPrice",
+        "listingPrice",
+    ):
+        raw = maybe_nested_value(item, key)
+        price = normalize_ton_value(raw)
+        if price is not None:
+            return price
+    return None
+
+
+def extract_sale_price(item: Dict[str, Any]) -> Optional[float]:
+    for key in ("salePrice", "sellPrice", "lastSalePrice", "avgSalePrice"):
+        price = normalize_ton_value(maybe_nested_value(item, key))
+        if price is not None:
+            return price
+    return extract_price(item)
+
+
+def extract_buy_price(item: Dict[str, Any]) -> Optional[float]:
+    for key in ("buyPrice", "offerPrice", "bestOffer", "floorPrice"):
+        price = normalize_ton_value(maybe_nested_value(item, key))
+        if price is not None:
+            return price
+    return extract_price(item)
 
 
 def extract_name(item: Dict[str, Any]) -> str:
     for key in ("collectionName", "giftName", "name", "title"):
-        val = item.get(key)
+        val = maybe_nested_value(item, key)
         if val:
             return str(val)
     return "Unknown"
 
 
-
 def extract_model(item: Dict[str, Any]) -> str:
     for key in ("modelName", "model", "variant"):
-        val = item.get(key)
+        val = maybe_nested_value(item, key)
         if val:
             return str(val)
     return "—"
 
 
+def extract_symbol(item: Dict[str, Any]) -> str:
+    for key in ("symbolName", "symbol"):
+        val = maybe_nested_value(item, key)
+        if val:
+            return str(val)
+    return "—"
+
+
+def extract_backdrop(item: Dict[str, Any]) -> str:
+    for key in ("backdropName", "backgroundName", "backdrop"):
+        val = maybe_nested_value(item, key)
+        if val:
+            return str(val)
+    return "—"
+
 
 def extract_link(item: Dict[str, Any]) -> str:
-    for key in ("url", "shareUrl", "link"):
-        val = item.get(key)
+    for key in ("url", "shareUrl", "link", "telegramUrl"):
+        val = maybe_nested_value(item, key)
         if val:
             return str(val)
     return "https://t.me/mrkt"
 
 
+def extract_image(item: Dict[str, Any]) -> Optional[str]:
+    for key in (
+        "image",
+        "imageUrl",
+        "giftImage",
+        "giftImageUrl",
+        "previewImageUrl",
+        "photo",
+        "photoUrl",
+        "thumbnail",
+        "thumbnailUrl",
+        "coverUrl",
+    ):
+        val = maybe_nested_value(item, key)
+        if isinstance(val, str) and val.startswith(("http://", "https://")):
+            return val
+    return None
+
 
 def extract_listing_key(item: Dict[str, Any]) -> str:
     for key in ("id", "giftId", "listingId", "slug"):
-        if item.get(key) is not None:
-            return f"{key}:{item.get(key)}"
+        val = maybe_nested_value(item, key)
+        if val is not None:
+            return f"{key}:{val}"
     return json.dumps(item, sort_keys=True, ensure_ascii=False)
 
+
+def item_haystack(item: Dict[str, Any]) -> str:
+    return " ".join(
+        [
+            str(maybe_nested_value(item, "name") or ""),
+            str(maybe_nested_value(item, "title") or ""),
+            str(maybe_nested_value(item, "giftName") or ""),
+            str(maybe_nested_value(item, "collectionName") or ""),
+            str(maybe_nested_value(item, "modelName") or ""),
+            str(maybe_nested_value(item, "backdropName") or ""),
+            str(maybe_nested_value(item, "symbolName") or ""),
+        ]
+    ).lower()
 
 
 def gift_matches_filters(item: Dict[str, Any], user_filter: UserFilter) -> bool:
     collections = [x.strip().lower() for x in user_filter.collections if x.strip()]
     models = [x.strip().lower() for x in user_filter.models if x.strip()]
-
-    haystack = " ".join(
-        [
-            str(item.get("name", "")),
-            str(item.get("title", "")),
-            str(item.get("giftName", "")),
-            str(item.get("collectionName", "")),
-            str(item.get("modelName", "")),
-            str(item.get("backdropName", "")),
-            str(item.get("symbolName", "")),
-        ]
-    ).lower()
+    haystack = item_haystack(item)
 
     if collections and not any(word in haystack for word in collections):
         return False
-
     if models and not any(word in haystack for word in models):
         return False
 
@@ -336,13 +417,11 @@ def gift_matches_filters(item: Dict[str, Any], user_filter: UserFilter) -> bool:
         return False
     if user_filter.max_price is not None and price is not None and price > user_filter.max_price:
         return False
-
     return True
 
 
-
 def fetch_gifts(user_filter: UserFilter) -> List[Dict[str, Any]]:
-    payload = build_payload()
+    payload = build_payload(user_filter)
     response = requests.post(
         f"{API_BASE}/gifts/saling",
         headers=mrkt_headers(),
@@ -351,27 +430,57 @@ def fetch_gifts(user_filter: UserFilter) -> List[Dict[str, Any]]:
     )
 
     if response.status_code >= 400:
-        body_preview = response.text[:1000]
+        body_preview = response.text[:1500]
+        logger.error("MRKT error %s, payload=%s, body=%s", response.status_code, payload, body_preview)
         raise MRKTAPIError(f"{response.status_code} {body_preview}")
 
     data = response.json()
     gifts = extract_gifts_from_response(data)
-    return [item for item in gifts if gift_matches_filters(item, user_filter)]
+    filtered = [item for item in gifts if gift_matches_filters(item, user_filter)]
+    return filtered
 
+
+def avg(values: List[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
 
 
 def compute_stats(gifts: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
-    prices = [extract_price(x) for x in gifts]
-    prices = [x for x in prices if x is not None]
-    if not prices:
-        return {"count": 0, "min": None, "avg": None, "median": None}
+    listing_prices = [extract_price(x) for x in gifts]
+    listing_prices = [x for x in listing_prices if x is not None]
+    sale_prices = [extract_sale_price(x) for x in gifts]
+    sale_prices = [x for x in sale_prices if x is not None]
+    buy_prices = [extract_buy_price(x) for x in gifts]
+    buy_prices = [x for x in buy_prices if x is not None]
+
+    if not listing_prices:
+        return {
+            "count": 0,
+            "min": None,
+            "avg_sale": None,
+            "avg_buy": None,
+            "median": None,
+        }
+
     return {
-        "count": len(prices),
-        "min": min(prices),
-        "avg": sum(prices) / len(prices),
-        "median": statistics.median(prices),
+        "count": len(listing_prices),
+        "min": min(listing_prices),
+        "avg_sale": avg(sale_prices) or avg(listing_prices),
+        "avg_buy": avg(buy_prices) or min(listing_prices),
+        "median": statistics.median(listing_prices),
     }
 
+
+def format_ton(value: Optional[float]) -> str:
+    if value is None:
+        return "—"
+    if value >= 100:
+        return f"{value:,.2f}".replace(",", " ")
+    if value >= 1:
+        text = f"{value:.3f}"
+    else:
+        text = f"{value:.4f}"
+    text = text.rstrip("0").rstrip(".")
+    return text
 
 
 def format_stats_text(stats: Dict[str, Optional[float]], title: str = "Статистика") -> str:
@@ -380,11 +489,11 @@ def format_stats_text(stats: Dict[str, Optional[float]], title: str = "Стат�
     return (
         f"<b>{title}</b>\n"
         f"Лотов в выборке: <b>{stats['count']}</b>\n"
-        f"Минимум: <b>{stats['min']:.2f} TON</b>\n"
-        f"Средняя цена выставления: <b>{stats['avg']:.2f} TON</b>\n"
-        f"Медиана: <b>{stats['median']:.2f} TON</b>"
+        f"Минимальная цена: <b>{format_ton(stats['min'])} TON</b>\n"
+        f"Средняя цена продажи: <b>{format_ton(stats['avg_sale'])} TON</b>\n"
+        f"Средняя цена покупки: <b>{format_ton(stats['avg_buy'])} TON</b>\n"
+        f"Медиана: <b>{format_ton(stats['median'])} TON</b>"
     )
-
 
 
 def pretty_filter_text(user_filter: UserFilter) -> str:
@@ -392,10 +501,30 @@ def pretty_filter_text(user_filter: UserFilter) -> str:
         "<b>Твои фильтры</b>\n"
         f"Подарки: <code>{', '.join(user_filter.collections) if user_filter.collections else 'все'}</code>\n"
         f"Модели: <code>{', '.join(user_filter.models) if user_filter.models else 'все'}</code>\n"
-        f"Мин. цена: <code>{user_filter.min_price if user_filter.min_price is not None else 'не задана'}</code>\n"
-        f"Макс. цена: <code>{user_filter.max_price if user_filter.max_price is not None else 'не задана'}</code>\n"
+        f"Мин. цена: <code>{format_ton(user_filter.min_price) if user_filter.min_price is not None else 'не задана'}</code>\n"
+        f"Макс. цена: <code>{format_ton(user_filter.max_price) if user_filter.max_price is not None else 'не задана'}</code>\n"
         f"Уведомления: <b>{'включены' if user_filter.is_enabled else 'выключены'}</b>"
     )
+
+
+def build_listing_caption(item: Dict[str, Any]) -> str:
+    lines = [
+        "<b>Новое выставление на MRKT</b>",
+        f"Подарок: <b>{extract_name(item)}</b>",
+        f"Модель: <b>{extract_model(item)}</b>",
+    ]
+
+    symbol = extract_symbol(item)
+    backdrop = extract_backdrop(item)
+    if symbol != "—":
+        lines.append(f"Символ: <b>{symbol}</b>")
+    if backdrop != "—":
+        lines.append(f"Фон: <b>{backdrop}</b>")
+
+    price = extract_price(item)
+    lines.append(f"Цена: <b>{format_ton(price)} TON</b>" if price is not None else "Цена: <b>не указана</b>")
+    lines.append(f"Ссылка: {extract_link(item)}")
+    return "\n".join(lines)
 
 
 async def start_cmd(message: Message) -> None:
@@ -404,8 +533,8 @@ async def start_cmd(message: Message) -> None:
         "<b>MRKT Alert Bot</b>\n\n"
         "Бот следит за новыми выставлениями на MRKT и шлёт алерты по твоим фильтрам.\n\n"
         "Команды:\n"
-        "/set_collections часы, кепки\n"
-        "/set_models albino, gold\n"
+        "/set_collections Chill Flame, Vice Cream\n"
+        "/set_models Albino, Geometry\n"
         "/set_price 1 20\n"
         "/reset_price\n"
         "/stats\n"
@@ -419,13 +548,13 @@ async def start_cmd(message: Message) -> None:
 async def help_cmd(message: Message) -> None:
     await message.answer(
         "<b>Как пользоваться</b>\n"
-        "1. Задай ключевые слова по подаркам: <code>/set_collections часы, кепки</code>\n"
-        "2. При желании укажи модели: <code>/set_models gold, black</code>\n"
+        "1. Задай названия подарков: <code>/set_collections Chill Flame, Vice Cream</code>\n"
+        "2. При желании укажи модели: <code>/set_models Albino, Geometry</code>\n"
         "3. Ограничь цену: <code>/set_price 1 15</code>\n"
         "4. Сбросить цену: <code>/reset_price</code>\n"
         "5. Получи статистику: <code>/stats</code>\n"
         "6. Оставь бот включённым — он будет слать новые лоты по фильтру.\n\n"
-        "Важно: API MRKT фильтруется по внутренним значениям, поэтому бот теперь берёт общий список лотов и фильтрует его локально по словам и цене."
+        "Цены теперь показываются в нормальном формате TON, а не в nanoTON."
     )
 
 
@@ -481,7 +610,7 @@ async def set_price_cmd(message: Message) -> None:
         return
 
     update_filter(message.from_user.id, min_price=min_price, max_price=max_price)
-    await message.answer(f"Диапазон цены сохранён: <b>{min_price}</b>–<b>{max_price}</b> TON")
+    await message.answer(f"Диапазон цены сохранён: <b>{format_ton(min_price)}</b>–<b>{format_ton(max_price)}</b> TON")
 
 
 async def reset_price_cmd(message: Message) -> None:
@@ -508,7 +637,7 @@ async def stats_cmd(message: Message) -> None:
     for item in gifts[:5]:
         price = extract_price(item)
         if price is not None:
-            preview.append(f"• {extract_name(item)} / {extract_model(item)} — <b>{price:.2f} TON</b>")
+            preview.append(f"• {extract_name(item)} / {extract_model(item)} — <b>{format_ton(price)} TON</b>")
         else:
             preview.append(f"• {extract_name(item)} / {extract_model(item)}")
     if preview:
@@ -531,16 +660,15 @@ async def monitor_loop(bot: Bot) -> None:
                         new_items.append(item)
 
                 for item in new_items[:10]:
-                    price = extract_price(item)
-                    price_text = f"<b>{price:.2f} TON</b>" if price is not None else "<b>цена не указана</b>"
-                    text = (
-                        "<b>Новое выставление на MRKT</b>\n"
-                        f"Подарок: <b>{extract_name(item)}</b>\n"
-                        f"Модель: <b>{extract_model(item)}</b>\n"
-                        f"Цена: {price_text}\n"
-                        f"Ссылка: {extract_link(item)}"
-                    )
-                    await bot.send_message(user_id, text)
+                    caption = build_listing_caption(item)
+                    image_url = extract_image(item)
+                    if image_url:
+                        try:
+                            await bot.send_photo(user_id, photo=image_url, caption=caption)
+                            continue
+                        except Exception:
+                            logger.exception("Failed to send photo preview for user %s", user_id)
+                    await bot.send_message(user_id, caption)
             except Exception as e:
                 logger.exception("monitor_loop failed for user %s: %s", user_id, e)
                 if user_id in ADMIN_IDS:
