@@ -1,19 +1,21 @@
 import asyncio
+import html
 import json
 import logging
+import math
 import os
 import sqlite3
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
@@ -26,6 +28,8 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "45"))
 DEFAULT_SAMPLE_LIMIT = min(int(os.getenv("DEFAULT_SAMPLE_LIMIT", "20")), 20)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+COLLECTIONS_PAGE_SIZE = 8
+DISCOVERY_MAX_PAGES = 25
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -148,8 +152,8 @@ def update_filter(
         WHERE user_id = ?
         """,
         (
-            json.dumps(new_collections, ensure_ascii=False),
-            json.dumps(new_models, ensure_ascii=False),
+            json.dumps(sorted(dict.fromkeys(new_collections)), ensure_ascii=False),
+            json.dumps(sorted(dict.fromkeys(new_models)), ensure_ascii=False),
             new_min,
             new_max,
             int(time.time()),
@@ -202,10 +206,35 @@ def remember_listing(listing_key: str) -> bool:
         conn.close()
 
 
-def build_payload(user_filter: UserFilter) -> Dict[str, Any]:
+def to_raw_ton_value(value: float) -> int:
+    return int(round(value * 1_000_000_000))
+
+
+def from_raw_ton_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip().replace(",", ".")
+        if not value:
+            return None
+        try:
+            num = float(value)
+        except ValueError:
+            return None
+    elif isinstance(value, (int, float)):
+        num = float(value)
+    else:
+        return None
+
+    if abs(num) >= 1_000_000:
+        return num / 1_000_000_000
+    return num
+
+
+def build_payload(user_filter: Optional[UserFilter] = None, *, cursor: str = "", count: Optional[int] = None) -> Dict[str, Any]:
     payload = {
-        "collectionNames": user_filter.collections,
-        "modelNames": user_filter.models,
+        "collectionNames": user_filter.collections if user_filter else [],
+        "modelNames": user_filter.models if user_filter else [],
         "backdropNames": [],
         "symbolNames": [],
         "ordering": "Price",
@@ -214,15 +243,16 @@ def build_payload(user_filter: UserFilter) -> Dict[str, Any]:
         "minPrice": None,
         "mintable": None,
         "number": None,
-        "count": DEFAULT_SAMPLE_LIMIT,
-        "cursor": "",
+        "count": min(count or DEFAULT_SAMPLE_LIMIT, 20),
+        "cursor": cursor,
         "query": None,
         "promotedFirst": False,
     }
-    if user_filter.max_price is not None:
-        payload["maxPrice"] = to_raw_ton_value(user_filter.max_price)
-    if user_filter.min_price is not None:
-        payload["minPrice"] = to_raw_ton_value(user_filter.min_price)
+    if user_filter:
+        if user_filter.max_price is not None:
+            payload["maxPrice"] = to_raw_ton_value(user_filter.max_price)
+        if user_filter.min_price is not None:
+            payload["minPrice"] = to_raw_ton_value(user_filter.min_price)
     return payload
 
 
@@ -254,76 +284,41 @@ def extract_gifts_from_response(data: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def maybe_nested_value(item: Dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in item and item[key] not in (None, ""):
-            return item[key]
-    for nested_key in ("gift", "item", "nft", "asset"):
-        nested = item.get(nested_key)
-        if isinstance(nested, dict):
-            for key in keys:
-                if key in nested and nested[key] not in (None, ""):
-                    return nested[key]
-    return None
-
-
-def normalize_ton_value(value: Any) -> Optional[float]:
-    if value is None or value == "":
+def extract_cursor(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
         return None
-    if isinstance(value, str):
-        value = value.replace("TON", "").replace("ton", "").replace(" ", "").replace(",", ".")
-        if not value:
-            return None
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
+    cursor = data.get("cursor")
+    if cursor in (None, ""):
         return None
-    # MRKT often returns nanoton integer values like 2180000000 -> 2.18 TON
-    if abs(num) >= 100000:
-        num = num / 1_000_000_000
-    return num
-
-
-def to_raw_ton_value(value: float) -> int:
-    return int(round(value * 1_000_000_000))
+    return str(cursor)
 
 
 def extract_price(item: Dict[str, Any]) -> Optional[float]:
-    for key in (
-        "price",
-        "salePrice",
-        "amount",
-        "tonPrice",
-        "floorPrice",
-        "currentPrice",
-        "listingPrice",
-    ):
-        raw = maybe_nested_value(item, key)
-        price = normalize_ton_value(raw)
+    for key in ("price", "salePrice", "amount", "tonPrice", "floorPrice"):
+        price = from_raw_ton_value(item.get(key))
         if price is not None:
             return price
     return None
 
 
-def extract_sale_price(item: Dict[str, Any]) -> Optional[float]:
-    for key in ("salePrice", "sellPrice", "lastSalePrice", "avgSalePrice"):
-        price = normalize_ton_value(maybe_nested_value(item, key))
-        if price is not None:
-            return price
-    return extract_price(item)
-
-
 def extract_buy_price(item: Dict[str, Any]) -> Optional[float]:
-    for key in ("buyPrice", "offerPrice", "bestOffer", "floorPrice"):
-        price = normalize_ton_value(maybe_nested_value(item, key))
-        if price is not None:
-            return price
-    return extract_price(item)
+    for key in ("buyPrice", "offerPrice", "bestOffer", "bestBuyPrice"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            for nested in ("price", "amount", "tonPrice"):
+                price = from_raw_ton_value(value.get(nested))
+                if price is not None:
+                    return price
+        else:
+            price = from_raw_ton_value(value)
+            if price is not None:
+                return price
+    return None
 
 
 def extract_name(item: Dict[str, Any]) -> str:
     for key in ("collectionName", "giftName", "name", "title"):
-        val = maybe_nested_value(item, key)
+        val = item.get(key)
         if val:
             return str(val)
     return "Unknown"
@@ -331,85 +326,51 @@ def extract_name(item: Dict[str, Any]) -> str:
 
 def extract_model(item: Dict[str, Any]) -> str:
     for key in ("modelName", "model", "variant"):
-        val = maybe_nested_value(item, key)
-        if val:
-            return str(val)
-    return "—"
-
-
-def extract_symbol(item: Dict[str, Any]) -> str:
-    for key in ("symbolName", "symbol"):
-        val = maybe_nested_value(item, key)
-        if val:
-            return str(val)
-    return "—"
-
-
-def extract_backdrop(item: Dict[str, Any]) -> str:
-    for key in ("backdropName", "backgroundName", "backdrop"):
-        val = maybe_nested_value(item, key)
+        val = item.get(key)
         if val:
             return str(val)
     return "—"
 
 
 def extract_link(item: Dict[str, Any]) -> str:
-    for key in ("url", "shareUrl", "link", "telegramUrl"):
-        val = maybe_nested_value(item, key)
+    for key in ("url", "shareUrl", "link"):
+        val = item.get(key)
         if val:
             return str(val)
     return "https://t.me/mrkt"
 
 
-def extract_image(item: Dict[str, Any]) -> Optional[str]:
-    for key in (
-        "image",
-        "imageUrl",
-        "giftImage",
-        "giftImageUrl",
-        "previewImageUrl",
-        "photo",
-        "photoUrl",
-        "thumbnail",
-        "thumbnailUrl",
-        "coverUrl",
-    ):
-        val = maybe_nested_value(item, key)
-        if isinstance(val, str) and val.startswith(("http://", "https://")):
-            return val
-    return None
-
-
 def extract_listing_key(item: Dict[str, Any]) -> str:
     for key in ("id", "giftId", "listingId", "slug"):
-        val = maybe_nested_value(item, key)
-        if val is not None:
-            return f"{key}:{val}"
+        if item.get(key) is not None:
+            return f"{key}:{item.get(key)}"
     return json.dumps(item, sort_keys=True, ensure_ascii=False)
 
 
-def item_haystack(item: Dict[str, Any]) -> str:
-    return " ".join(
-        [
-            str(maybe_nested_value(item, "name") or ""),
-            str(maybe_nested_value(item, "title") or ""),
-            str(maybe_nested_value(item, "giftName") or ""),
-            str(maybe_nested_value(item, "collectionName") or ""),
-            str(maybe_nested_value(item, "modelName") or ""),
-            str(maybe_nested_value(item, "backdropName") or ""),
-            str(maybe_nested_value(item, "symbolName") or ""),
-        ]
-    ).lower()
+def extract_image_url(item: Dict[str, Any]) -> Optional[str]:
+    for key in ("imageUrl", "photoUrl", "previewUrl", "thumbnailUrl"):
+        val = item.get(key)
+        if isinstance(val, str) and val.startswith("http"):
+            return val
+    sticker = item.get("sticker")
+    if isinstance(sticker, dict):
+        for key in ("imageUrl", "previewUrl"):
+            val = sticker.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                return val
+    return None
 
 
 def gift_matches_filters(item: Dict[str, Any], user_filter: UserFilter) -> bool:
     collections = [x.strip().lower() for x in user_filter.collections if x.strip()]
     models = [x.strip().lower() for x in user_filter.models if x.strip()]
-    haystack = item_haystack(item)
 
-    if collections and not any(word in haystack for word in collections):
+    item_collection = extract_name(item).strip().lower()
+    item_model = extract_model(item).strip().lower()
+
+    if collections and item_collection not in collections:
         return False
-    if models and not any(word in haystack for word in models):
+    if models and item_model not in models:
         return False
 
     price = extract_price(item)
@@ -420,67 +381,62 @@ def gift_matches_filters(item: Dict[str, Any], user_filter: UserFilter) -> bool:
     return True
 
 
-def fetch_gifts(user_filter: UserFilter) -> List[Dict[str, Any]]:
-    payload = build_payload(user_filter)
+def fetch_raw_page(payload: Dict[str, Any]) -> Dict[str, Any]:
     response = requests.post(
         f"{API_BASE}/gifts/saling",
         headers=mrkt_headers(),
         json=payload,
         timeout=REQUEST_TIMEOUT,
     )
-
     if response.status_code >= 400:
-        body_preview = response.text[:1500]
-        logger.error("MRKT error %s, payload=%s, body=%s", response.status_code, payload, body_preview)
+        body_preview = response.text[:1000]
         raise MRKTAPIError(f"{response.status_code} {body_preview}")
+    return response.json()
 
-    data = response.json()
+
+def fetch_gifts(user_filter: UserFilter) -> List[Dict[str, Any]]:
+    data = fetch_raw_page(build_payload(user_filter))
     gifts = extract_gifts_from_response(data)
-    filtered = [item for item in gifts if gift_matches_filters(item, user_filter)]
-    return filtered
+    return [item for item in gifts if gift_matches_filters(item, user_filter)]
 
 
-def avg(values: List[float]) -> Optional[float]:
-    return sum(values) / len(values) if values else None
+def discover_all_collections(max_pages: int = DISCOVERY_MAX_PAGES) -> List[str]:
+    cursor = ""
+    found: set[str] = set()
+    for _ in range(max_pages):
+        data = fetch_raw_page(build_payload(None, cursor=cursor, count=20))
+        gifts = extract_gifts_from_response(data)
+        for item in gifts:
+            name = extract_name(item).strip()
+            if name:
+                found.add(name)
+        next_cursor = extract_cursor(data)
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    return sorted(found, key=str.lower)
 
 
 def compute_stats(gifts: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
-    listing_prices = [extract_price(x) for x in gifts]
-    listing_prices = [x for x in listing_prices if x is not None]
-    sale_prices = [extract_sale_price(x) for x in gifts]
-    sale_prices = [x for x in sale_prices if x is not None]
+    sell_prices = [extract_price(x) for x in gifts]
+    sell_prices = [x for x in sell_prices if x is not None]
     buy_prices = [extract_buy_price(x) for x in gifts]
     buy_prices = [x for x in buy_prices if x is not None]
 
-    if not listing_prices:
-        return {
-            "count": 0,
-            "min": None,
-            "avg_sale": None,
-            "avg_buy": None,
-            "median": None,
-        }
-
     return {
-        "count": len(listing_prices),
-        "min": min(listing_prices),
-        "avg_sale": avg(sale_prices) or avg(listing_prices),
-        "avg_buy": avg(buy_prices) or min(listing_prices),
-        "median": statistics.median(listing_prices),
+        "count": len(sell_prices),
+        "min": min(sell_prices) if sell_prices else None,
+        "avg_sell": (sum(sell_prices) / len(sell_prices)) if sell_prices else None,
+        "avg_buy": (sum(buy_prices) / len(buy_prices)) if buy_prices else None,
+        "median": statistics.median(sell_prices) if sell_prices else None,
     }
 
 
-def format_ton(value: Optional[float]) -> str:
+def fmt_ton(value: Optional[float]) -> str:
     if value is None:
         return "—"
-    if value >= 100:
-        return f"{value:,.2f}".replace(",", " ")
-    if value >= 1:
-        text = f"{value:.3f}"
-    else:
-        text = f"{value:.4f}"
-    text = text.rstrip("0").rstrip(".")
-    return text
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return f"{text} TON"
 
 
 def format_stats_text(stats: Dict[str, Optional[float]], title: str = "Статистика") -> str:
@@ -489,42 +445,64 @@ def format_stats_text(stats: Dict[str, Optional[float]], title: str = "Стат�
     return (
         f"<b>{title}</b>\n"
         f"Лотов в выборке: <b>{stats['count']}</b>\n"
-        f"Минимальная цена: <b>{format_ton(stats['min'])} TON</b>\n"
-        f"Средняя цена продажи: <b>{format_ton(stats['avg_sale'])} TON</b>\n"
-        f"Средняя цена покупки: <b>{format_ton(stats['avg_buy'])} TON</b>\n"
-        f"Медиана: <b>{format_ton(stats['median'])} TON</b>"
+        f"Минимум: <b>{fmt_ton(stats['min'])}</b>\n"
+        f"Средняя цена продажи: <b>{fmt_ton(stats['avg_sell'])}</b>\n"
+        f"Средняя цена покупки: <b>{fmt_ton(stats['avg_buy'])}</b>\n"
+        f"Медиана продажи: <b>{fmt_ton(stats['median'])}</b>"
     )
 
 
 def pretty_filter_text(user_filter: UserFilter) -> str:
     return (
         "<b>Твои фильтры</b>\n"
-        f"Подарки: <code>{', '.join(user_filter.collections) if user_filter.collections else 'все'}</code>\n"
+        f"Коллекции: <code>{', '.join(user_filter.collections) if user_filter.collections else 'все'}</code>\n"
         f"Модели: <code>{', '.join(user_filter.models) if user_filter.models else 'все'}</code>\n"
-        f"Мин. цена: <code>{format_ton(user_filter.min_price) if user_filter.min_price is not None else 'не задана'}</code>\n"
-        f"Макс. цена: <code>{format_ton(user_filter.max_price) if user_filter.max_price is not None else 'не задана'}</code>\n"
+        f"Мин. цена: <code>{user_filter.min_price if user_filter.min_price is not None else 'не задана'}</code>\n"
+        f"Макс. цена: <code>{user_filter.max_price if user_filter.max_price is not None else 'не задана'}</code>\n"
         f"Уведомления: <b>{'включены' if user_filter.is_enabled else 'выключены'}</b>"
     )
 
 
-def build_listing_caption(item: Dict[str, Any]) -> str:
-    lines = [
-        "<b>Новое выставление на MRKT</b>",
-        f"Подарок: <b>{extract_name(item)}</b>",
-        f"Модель: <b>{extract_model(item)}</b>",
-    ]
+def chunked(items: Sequence[str], size: int) -> List[List[str]]:
+    return [list(items[i : i + size]) for i in range(0, len(items), size)]
 
-    symbol = extract_symbol(item)
-    backdrop = extract_backdrop(item)
-    if symbol != "—":
-        lines.append(f"Символ: <b>{symbol}</b>")
-    if backdrop != "—":
-        lines.append(f"Фон: <b>{backdrop}</b>")
 
-    price = extract_price(item)
-    lines.append(f"Цена: <b>{format_ton(price)} TON</b>" if price is not None else "Цена: <b>не указана</b>")
-    lines.append(f"Ссылка: {extract_link(item)}")
-    return "\n".join(lines)
+def collection_selector_keyboard(all_collections: Sequence[str], selected: Sequence[str], page: int = 0) -> InlineKeyboardMarkup:
+    pages = chunked(list(all_collections), COLLECTIONS_PAGE_SIZE) or [[]]
+    page = max(0, min(page, len(pages) - 1))
+    selected_set = {x.lower() for x in selected}
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for name in pages[page]:
+        mark = "✅ " if name.lower() in selected_set else "▫️ "
+        rows.append([
+            InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"coll_toggle:{page}:{name}"),
+        ])
+
+    rows.append(
+        [
+            InlineKeyboardButton(text="✅ Все" if not selected else "Выбрать все", callback_data=f"coll_all:{page}"),
+            InlineKeyboardButton(text="Очистить", callback_data=f"coll_clear:{page}"),
+        ]
+    )
+
+    nav: List[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"coll_page:{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{len(pages)}", callback_data="coll_noop"))
+    if page < len(pages) - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"coll_page:{page + 1}"))
+    rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="Закрыть", callback_data="coll_close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def safe_edit_text(target: Message, text: str, reply_markup: InlineKeyboardMarkup) -> None:
+    try:
+        await target.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        await target.answer(text, reply_markup=reply_markup)
 
 
 async def start_cmd(message: Message) -> None:
@@ -533,8 +511,10 @@ async def start_cmd(message: Message) -> None:
         "<b>MRKT Alert Bot</b>\n\n"
         "Бот следит за новыми выставлениями на MRKT и шлёт алерты по твоим фильтрам.\n\n"
         "Команды:\n"
+        "/collections — выбрать коллекции кнопками\n"
         "/set_collections Chill Flame, Vice Cream\n"
-        "/set_models Albino, Geometry\n"
+        "/set_collections all\n"
+        "/set_models Albino, Gold\n"
         "/set_price 1 20\n"
         "/reset_price\n"
         "/stats\n"
@@ -548,19 +528,37 @@ async def start_cmd(message: Message) -> None:
 async def help_cmd(message: Message) -> None:
     await message.answer(
         "<b>Как пользоваться</b>\n"
-        "1. Задай названия подарков: <code>/set_collections Chill Flame, Vice Cream</code>\n"
-        "2. При желании укажи модели: <code>/set_models Albino, Geometry</code>\n"
-        "3. Ограничь цену: <code>/set_price 1 15</code>\n"
-        "4. Сбросить цену: <code>/reset_price</code>\n"
-        "5. Получи статистику: <code>/stats</code>\n"
-        "6. Оставь бот включённым — он будет слать новые лоты по фильтру.\n\n"
-        "Цены теперь показываются в нормальном формате TON, а не в nanoTON."
+        "1. Открой список всех коллекций: <code>/collections</code>\n"
+        "2. Выбери несколько нужных коллекций кнопками или нажми «Выбрать все».\n"
+        "3. При желании укажи модели: <code>/set_models Albino, Gold</code>\n"
+        "4. Ограничь цену: <code>/set_price 1 15</code>\n"
+        "5. Сбросить цену: <code>/reset_price</code>\n"
+        "6. Получи статистику: <code>/stats</code>"
     )
 
 
 async def filters_cmd(message: Message) -> None:
     ensure_user(message.from_user.id)
     await message.answer(pretty_filter_text(get_filter(message.from_user.id)))
+
+
+async def collections_cmd(message: Message) -> None:
+    ensure_user(message.from_user.id)
+    await message.answer("Собираю список всех коллекций MRKT, подожди пару секунд...")
+    try:
+        all_collections = await asyncio.to_thread(discover_all_collections)
+    except Exception as e:
+        await message.answer(f"Не удалось получить коллекции: <code>{html.escape(str(e))}</code>")
+        return
+
+    user_filter = get_filter(message.from_user.id)
+    text = (
+        "<b>Выбор коллекций</b>\n"
+        "Можно выбрать несколько коллекций.\n"
+        "Если фильтр пустой — бот показывает <b>все</b> коллекции.\n\n"
+        f"Сейчас выбрано: <code>{', '.join(user_filter.collections) if user_filter.collections else 'все'}</code>"
+    )
+    await message.answer(text, reply_markup=collection_selector_keyboard(all_collections, user_filter.collections, 0))
 
 
 async def on_cmd(message: Message) -> None:
@@ -578,15 +576,21 @@ async def off_cmd(message: Message) -> None:
 async def set_collections_cmd(message: Message) -> None:
     ensure_user(message.from_user.id)
     raw = (message.text or "").replace("/set_collections", "", 1).strip()
-    values = [x.strip() for x in raw.split(",") if x.strip()]
+    if raw.lower() in {"all", "все", "*"}:
+        values: List[str] = []
+    else:
+        values = [x.strip() for x in raw.split(",") if x.strip()]
     update_filter(message.from_user.id, collections=values)
-    await message.answer(f"Сохранил подарки: <code>{', '.join(values) if values else 'все'}</code>")
+    await message.answer(f"Сохранил коллекции: <code>{', '.join(values) if values else 'все'}</code>")
 
 
 async def set_models_cmd(message: Message) -> None:
     ensure_user(message.from_user.id)
     raw = (message.text or "").replace("/set_models", "", 1).strip()
-    values = [x.strip() for x in raw.split(",") if x.strip()]
+    if raw.lower() in {"all", "все", "*"}:
+        values: List[str] = []
+    else:
+        values = [x.strip() for x in raw.split(",") if x.strip()]
     update_filter(message.from_user.id, models=values)
     await message.answer(f"Сохранил модели: <code>{', '.join(values) if values else 'все'}</code>")
 
@@ -610,7 +614,7 @@ async def set_price_cmd(message: Message) -> None:
         return
 
     update_filter(message.from_user.id, min_price=min_price, max_price=max_price)
-    await message.answer(f"Диапазон цены сохранён: <b>{format_ton(min_price)}</b>–<b>{format_ton(max_price)}</b> TON")
+    await message.answer(f"Диапазон цены сохранён: <b>{min_price}</b>–<b>{max_price}</b> TON")
 
 
 async def reset_price_cmd(message: Message) -> None:
@@ -623,26 +627,85 @@ async def stats_cmd(message: Message) -> None:
     ensure_user(message.from_user.id)
     user_filter = get_filter(message.from_user.id)
     try:
-        gifts = fetch_gifts(user_filter)
+        gifts = await asyncio.to_thread(fetch_gifts, user_filter)
     except MRKTAPIError as e:
-        await message.answer(f"Ошибка MRKT API: <code>{e}</code>")
+        await message.answer(f"Ошибка MRKT API: <code>{html.escape(str(e))}</code>")
         return
     except Exception as e:
-        await message.answer(f"Ошибка запроса к MRKT: <code>{e}</code>")
+        await message.answer(f"Ошибка запроса к MRKT: <code>{html.escape(str(e))}</code>")
         return
 
     stats = compute_stats(gifts)
     lines = [format_stats_text(stats)]
     preview = []
     for item in gifts[:5]:
-        price = extract_price(item)
-        if price is not None:
-            preview.append(f"• {extract_name(item)} / {extract_model(item)} — <b>{format_ton(price)} TON</b>")
-        else:
-            preview.append(f"• {extract_name(item)} / {extract_model(item)}")
+        preview.append(f"• {html.escape(extract_name(item))} / {html.escape(extract_model(item))} — <b>{fmt_ton(extract_price(item))}</b>")
     if preview:
         lines.append("\n<b>Первые лоты:</b>\n" + "\n".join(preview))
     await message.answer("\n\n".join(lines))
+
+
+async def collection_callback(callback: CallbackQuery) -> None:
+    ensure_user(callback.from_user.id)
+    user_filter = get_filter(callback.from_user.id)
+
+    try:
+        all_collections = await asyncio.to_thread(discover_all_collections)
+    except Exception as e:
+        await callback.answer(f"Не удалось загрузить коллекции: {e}", show_alert=True)
+        return
+
+    data = callback.data or ""
+    if data == "coll_noop":
+        await callback.answer()
+        return
+    if data == "coll_close":
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Закрыто")
+        return
+
+    page = 0
+    if ":" in data:
+        try:
+            page = int(data.split(":", 2)[1])
+        except Exception:
+            page = 0
+
+    selected = list(user_filter.collections)
+    selected_lower = {x.lower() for x in selected}
+
+    if data.startswith("coll_page:"):
+        pass
+    elif data.startswith("coll_all:"):
+        selected = []
+        update_filter(callback.from_user.id, collections=[])
+        user_filter = get_filter(callback.from_user.id)
+        selected = user_filter.collections
+    elif data.startswith("coll_clear:"):
+        selected = []
+        update_filter(callback.from_user.id, collections=[])
+        user_filter = get_filter(callback.from_user.id)
+        selected = user_filter.collections
+    elif data.startswith("coll_toggle:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            name = parts[2]
+            if name.lower() in selected_lower:
+                selected = [x for x in selected if x.lower() != name.lower()]
+            else:
+                selected.append(name)
+            update_filter(callback.from_user.id, collections=selected)
+            user_filter = get_filter(callback.from_user.id)
+            selected = user_filter.collections
+
+    text = (
+        "<b>Выбор коллекций</b>\n"
+        "Можно выбрать несколько коллекций.\n"
+        "Если фильтр пустой — бот показывает <b>все</b> коллекции.\n\n"
+        f"Сейчас выбрано: <code>{', '.join(selected) if selected else 'все'}</code>"
+    )
+    await callback.message.edit_text(text, reply_markup=collection_selector_keyboard(all_collections, selected, page))
+    await callback.answer("Сохранено")
 
 
 async def monitor_loop(bot: Bot) -> None:
@@ -652,7 +715,7 @@ async def monitor_loop(bot: Bot) -> None:
         for user_id in user_ids:
             try:
                 user_filter = get_filter(user_id)
-                gifts = fetch_gifts(user_filter)
+                gifts = await asyncio.to_thread(fetch_gifts, user_filter)
                 new_items = []
                 for item in gifts:
                     listing_key = extract_listing_key(item)
@@ -660,19 +723,26 @@ async def monitor_loop(bot: Bot) -> None:
                         new_items.append(item)
 
                 for item in new_items[:10]:
-                    caption = build_listing_caption(item)
-                    image_url = extract_image(item)
+                    price = fmt_ton(extract_price(item))
+                    text = (
+                        "<b>Новое выставление на MRKT</b>\n"
+                        f"Подарок: <b>{html.escape(extract_name(item))}</b>\n"
+                        f"Модель: <b>{html.escape(extract_model(item))}</b>\n"
+                        f"Цена: <b>{price}</b>\n"
+                        f"Ссылка: {html.escape(extract_link(item))}"
+                    )
+                    image_url = extract_image_url(item)
                     if image_url:
                         try:
-                            await bot.send_photo(user_id, photo=image_url, caption=caption)
+                            await bot.send_photo(user_id, image_url, caption=text)
                             continue
                         except Exception:
-                            logger.exception("Failed to send photo preview for user %s", user_id)
-                    await bot.send_message(user_id, caption)
+                            logger.exception("send_photo failed, fallback to text")
+                    await bot.send_message(user_id, text)
             except Exception as e:
                 logger.exception("monitor_loop failed for user %s: %s", user_id, e)
                 if user_id in ADMIN_IDS:
-                    await bot.send_message(user_id, f"Ошибка мониторинга: <code>{e}</code>")
+                    await bot.send_message(user_id, f"Ошибка мониторинга: <code>{html.escape(str(e))}</code>")
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -689,6 +759,7 @@ async def main() -> None:
     dp.message.register(start_cmd, CommandStart())
     dp.message.register(help_cmd, Command("help"))
     dp.message.register(filters_cmd, Command("filters"))
+    dp.message.register(collections_cmd, Command("collections"))
     dp.message.register(on_cmd, Command("on"))
     dp.message.register(off_cmd, Command("off"))
     dp.message.register(set_collections_cmd, Command("set_collections"))
@@ -696,6 +767,7 @@ async def main() -> None:
     dp.message.register(set_price_cmd, Command("set_price"))
     dp.message.register(reset_price_cmd, Command("reset_price"))
     dp.message.register(stats_cmd, Command("stats"))
+    dp.callback_query.register(collection_callback, F.data.startswith("coll_"))
 
     asyncio.create_task(monitor_loop(bot))
     await dp.start_polling(bot)
